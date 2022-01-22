@@ -6,7 +6,12 @@ import jax.numpy as jnp
 import numpy as np
 from haiku.initializers import RandomUniform
 from scipy import linalg as la
+from scipy import signal
 from scipy import special as ss
+
+
+def _batched(batch_size, shape):
+    return [batch_size, *shape] if batch_size else shape
 
 
 def transition(measure, N, **measure_args):
@@ -74,21 +79,56 @@ def transition(measure, N, **measure_args):
     return A, B
 
 
+class LegT(hk.RNNCore):
+    def __init__(self, units, theta, order, measure="legt", name=None):
+        super().__init__(name=name)
+        self.order = order
+        self.units = units
+        A, B = transition(measure, order)
+        # Construct A and B matrices
+        C = np.ones((1, order))
+        D = np.zeros((1,))
+        dA, dB, _, _, _ = signal.cont2discrete((A, B, C, D), dt=1.0 / theta)
+
+        self.A = dA - np.eye(order)  # puts into form: x += Ax
+        self.B = dB
+
+    def initial_state(self, batch_size=None):
+        shapes = [[self.units], [self.order]]
+        h, m = map(jnp.zeros, map(partial(_batched, batch_size), shapes))
+        return h, m
+
+    def __call__(self, x, state):
+        h0, m = state
+        u = sum(
+            hk.Linear(
+                1, w_init=jnp.zeros if v is m else RandomUniform(), with_bias=False
+            )(v)
+            for v in (x, h0, m)
+        )
+        m = m @ self.A.T + u @ self.B.T
+        h = jax.nn.tanh(
+            sum(hk.Linear(self.units, with_bias=False)(v) for v in (x, h0, m))
+        )
+        return h, (h, m)
+
+
 class LegS(hk.RNNCore):
     def __init__(
         self,
         units,
         max_length,
-        order=None,
+        order,
         gate=None,
+        measure="legs",
         name=None,
     ):
         super().__init__(name=name)
         self.units = units
         self.max_length = max_length
         self.gate = gate
-        self.order = order = order or units
-        A, B = transition("legs", order)
+        self.order = order
+        A, B = transition(measure, order)
         # Construct A and B matrices
 
         A_stacked = np.empty((max_length, order, order), dtype=A.dtype)
@@ -106,11 +146,8 @@ class LegS(hk.RNNCore):
         self.B = jnp.array(B_stacked)
 
     def initial_state(self, batch_size=None):
-        def batched(shape):
-            return [batch_size, *shape] if batch_size else shape
-
         shapes = [[self.units], [self.order]]
-        h, m = map(jnp.zeros, map(batched, shapes))
+        h, m = map(jnp.zeros, map(partial(_batched, batch_size), shapes))
         return h, m, jnp.array(0, dtype=int)
 
     def __call__(self, x, state):
